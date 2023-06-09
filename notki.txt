@@ -1,0 +1,124 @@
+import matplotlib.pyplot as plt
+import numpy as np
+from controllers.adrc_flc_controller import ADRFLController
+from trajectory_generators.constant_torque import ConstantTorque
+from trajectory_generators.sinusonidal import Sinusoidal
+from trajectory_generators.poly3 import Poly3
+from utils.simulation import simulate
+Tp = 0.001
+end = 5
+
+# traj_gen = ConstantTorque(np.array([0., 1.0])[:, np.newaxis])
+traj_gen = Sinusoidal(np.array([0., 1.]), np.array([2., 2.]), np.array([0., 0.]))
+# traj_gen = Poly3(np.array([0., 0.]), np.array([np.pi/4, np.pi/6]), end)
+
+b_est_1 = 15
+b_est_2 = 15
+kp_est_1 = 150
+kp_est_2 = 150
+kd_est_1 = 55
+kd_est_2 = 55
+p1 = 30
+p2 = 30
+
+q0, qdot0, _ = traj_gen.generate(0.)
+q1_0 = np.array([q0[0], qdot0[0]])
+q2_0 = np.array([q0[1], qdot0[1]])
+
+Kp = np.diag([kp_est_1, kp_est_2])
+Kd = np.diag([kd_est_1, kd_est_2])
+p = np.array([p1, p2])
+
+controller = ADRFLController(Tp, np.concatenate([q0, qdot0]), Kp, Kd, p)
+
+
+Q, Q_d, u, T = simulate("PYBULLET", traj_gen, controller, Tp, end)
+
+eso = np.array(controller.eso.states)
+
+plt.subplot(221)
+plt.plot(T, eso[:, 0])
+plt.plot(T, Q[:, 0], 'r')
+plt.subplot(222)
+plt.plot(T, eso[:, 2])
+plt.plot(T, Q[:, 2], 'r')
+plt.subplot(223)
+plt.plot(T, eso[:, 1])
+plt.plot(T, Q[:, 1], 'r')
+plt.subplot(224)
+plt.plot(T, eso[:, 3])
+plt.plot(T, Q[:, 3], 'r')
+plt.show()
+
+plt.subplot(221)
+plt.plot(T, Q[:, 0], 'r')
+plt.plot(T, Q_d[:, 0], 'b')
+plt.subplot(222)
+plt.plot(T, Q[:, 1], 'r')
+plt.plot(T, Q_d[:, 1], 'b')
+plt.subplot(223)
+plt.plot(T, u[:, 0], 'r')
+plt.plot(T, u[:, 1], 'b')
+plt.show()
+
+
+
+
+
+######################
+
+
+import numpy as np
+from observers.eso import ESO
+
+from .controller import Controller
+from models.manipulator_model import ManiuplatorModel
+# from .adrc_joint_controller import ADRCJointController
+# from models.ideal_model import IdealModel
+# from models.free_model import FreeModel
+
+
+class ADRFLController(Controller):
+    def __init__(self, Tp, q0, Kp, Kd, p):
+        self.model = ManiuplatorModel(Tp)
+        self.Kp = Kp
+        self.Kd = Kd
+        self.L = np.array([[3*p[0], 0], [0, 3*p[1]], [3*p[0]**2, 0],
+                           [0, 3*p[1]**2], [p[0]**3, 0], [0, p[1]**3]])
+        W = np.hstack([np.eye(2), np.zeros((2,4))])
+        A = np.eye(6,k=2)
+        B = np.zeros((6,2))
+
+        self.eso = ESO(A, B, W, self.L, q0, Tp)
+        self.update_params(q0[:2], q0[2:])
+
+    def update_params(self, q, q_dot):
+        x = np.concatenate([q, q_dot], axis=0)
+        M = self.model.M(x)
+        M_inv = np.linalg.inv(M)
+        C = self.model.C(x)
+        A = np.zeros((6, 6))
+        A[0:2, 2:4] = np.eye(2)
+        A[2:4, 4:6] = np.eye(2)
+        A[2:4, 2:4] = -M_inv @ C
+        B = np.zeros((6, 2))
+        B[2:4, :] = M_inv
+        self.eso.A = A
+        self.eso.B = B
+
+    def calculate_control(self, x, q_d, q_d_dot, q_d_ddot):
+        q1, q2, q1_dot, q2_dot = x
+        q = np.array([q1, q2])
+        M = self.model.M(x)
+        C = self.model.C(x)
+        z_hat = self.eso.get_state()
+        x_hat = z_hat[0:2]
+        x_hat_dot = z_hat[2:4]
+        f = z_hat[4:]
+
+        v = q_d_ddot + self.Kd @ (q_d_dot - x_hat_dot) + self.Kp @ (q_d - q)
+        u = M @ (v - f) + C @ x_hat_dot
+        self.last_u = u
+        self.update_params(x_hat, x_hat_dot)
+        self.eso.update(q.reshape(len(q), 1), u.reshape(len(u), 1))
+        return u
